@@ -217,7 +217,7 @@ def kvlm_parse(raw, start=0, dct=None):
     if space < 0 or newline < space:
         assert(newline == start)
         dct[None] = raw[start+1:]
-        return dict
+        return dct
     
     keyword = raw[start:space]
 
@@ -264,13 +264,13 @@ def cmd_log(args):
     print("}")
 
 def log_graphviz(repo, sha, seen):
-
     if sha in seen:
         return
     seen.add(sha)
 
     commit = object_read(repo, sha)
     short_hash = sha[0:8]
+    print(f'{commit.kvlm[None]=}')
     message = commit.kvlm[None].decode("utf8").strip()
     message = message.replace("\\", "\\\\")
     message = message.replace("\"", "\\\"")
@@ -349,7 +349,7 @@ class GitBlob(GitObject):
 
 class GitCommit(GitObject):
     fmt = b'commit'
-    def __init__(self):
+    def init(self):
         self.kvlm = dict()
 
     def deserialize(self, data):
