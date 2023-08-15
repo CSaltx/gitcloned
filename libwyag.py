@@ -118,6 +118,10 @@ def repo_find(path=".", required=True):
     
     return repo_find(parent, required)
 
+'''
+* Object read func
+** Reads obj, hash from repo inputted and outputs the GitObj that changes based on hash
+'''
 def object_read(repo, hash):
     path = repo_file(repo, "objects", hash[0:2], hash[2:])
 
@@ -140,8 +144,7 @@ def object_read(repo, hash):
             case b'tree': c = GitTree
             case b'tag': c = GitTag
             case b'blob': c = GitBlob
-            case _:
-                raise Exception("Unknown type {0} for object {1}".format(fmt.decode("ascii"), hash))
+            case _: raise Exception("Unknown type {0} for object {1}".format(fmt.decode("ascii"), hash))
         return c(raw[zero+1:])
         
 def object_find(repo, name, fmt=None, follow=True):
@@ -294,6 +297,122 @@ def log_graphviz(repo, sha, seen):
         print ("  c_{0} -> c_{1};".format(sha, p))
         log_graphviz(repo, p, seen)
 
+def tree_parse_one(raw, start=0):
+    spc = raw.find(b' ', start)
+    assert spc-start == 5 or spc-start == 6
+
+    mode = raw[start:spc]
+    if len(mode) == 5:
+        mode = b' ' + mode
+    
+    null = raw.find(b'\x00', spc)
+
+    path = raw[spc+1:null]
+
+    sha = format(int.from_bytes(raw[null+1:null+21], "big"), "040x")
+    return null+21, GitTreeLeaf(mode, path.decode("utf-8"), sha)
+
+def tree_parse(raw):
+    pos = 0
+    m = len(raw)
+    ret = []
+    while pos < m:
+        pos, data = tree_parse_one(raw, pos)
+        ret.append(data)
+    return ret
+
+def tree_leaf_sort_key(leaf: object):
+    if leaf.mode.startswith(b'10'):
+        return leaf.path
+    else:
+        return leaf.path + "/"
+
+def tree_serialize(obj):
+    ret = b''
+    obj.items.sort(key=tree_leaf_sort_key)
+    for i in obj.items:
+        ret += i.mode
+        ret += b' '
+        ret += i.path.encode('utf8')
+        ret += b'\x00'
+        sha = int(i.sha, 16)
+        ret += sha.to_bytes(20, byteorder='big')
+    return ret
+
+argsp = argsubparsers.add_parser('ls-tree', help="Print a tree obj")
+argsp.add_argument('-r', dest="recursive", action="store_true", help="Recurse into sub trees")
+argsp.add_argument('tree', help='A "tree" object')
+
+def cmd_ls_tree(args):
+    repo = repo_find()
+    ls_tree(repo, args.tree, args.recursive)
+
+def ls_tree(repo, tree, recur=None, prefix=""):
+    sha = object_find(repo, tree, fmt=b'tree')
+    obj = object_read(repo, sha)
+    for item in obj.items:
+        if len(item.mode) == 5:
+            mode = item.mode[:1]
+        else:
+            mode = item.most[:2]
+    
+    match mode:
+        case b'04': mode = "tree"
+        case b'10': mode = "blob" # A regular file.
+        case b'12': mode = "blob" # A symlink. Blob contents is link target.
+        case b'16': mode = "commit" # A submodule
+        case _: raise Exception(f"Weird tree leaf mode {item.mode}")
+    
+    if (not recur and mode=="tree"):
+        print("{0} {1} {2}\t{3}".format(
+                "0" * (6 - len(item.mode)) + item.mode.decode("ascii"),
+                type,
+                item.sha,
+                os.path.join(prefix, item.path)))
+    else:
+        ls_tree(repo, item.sha, recur, os.path.join(prefix, item.path))
+
+'''
+* Git Checkout Code
+'''
+
+argsp = argsubparsers.add_parser('checkout', help="Checkout a commit inside of a directory.")
+argsp.add_argument('commit', help="The commit or tree to checkout")
+argsp.add_argument('path', help="The empty dir to checkout to")
+
+def cmd_checkout(args):
+    repo = repo_find()
+    obj = object_read(repo, object_find(repo, args.commit))
+    # if commit, get the tree associated
+    if obj == b'commit':
+        obj = object_read(repo, obj.kvlm[b'tree'].decode('ascii'))
+    if os.path.exists(args.path):
+        if not os.path.isdir(args.path):
+            raise Exception(f'Path {args.path} is not a directory.')
+        if os.listdir(args.path):
+            raise Exception(f'Path {args.path} is not empty.')
+    else:
+        os.makedirs(args.path)
+    
+    tree_checkout(repo, obj, os.path.realpath(args.path))
+
+def tree_checkout(repo, tree, path):
+    for item in tree.items:
+        obj = object_read(repo, item.sha)
+        dest = os.path.join(path, item.path)
+        if item.mode == b'tree':
+            os.mkdir(dest)
+            tree_checkout(repo, obj, dest)
+        elif item.mode == b'blob':
+            with open(dest, 'wb') as f:
+                f.write(obj.data)
+        else:
+            raise Exception(f'Unknown tree item mode {item.mode}')
+            # ideally support symlinks in future
+'''
+*
+'''
+
 class GitRepository (object):
 
     worktree = None
@@ -321,7 +440,7 @@ class GitRepository (object):
             if vers != 0:
                 raise Exception(f"Unsupported repositoryformatversion {vers}")
 
-class GitObject (object):
+class GitObject:
 
     def __init__(self, data=None):
         if data != None:
@@ -357,3 +476,21 @@ class GitCommit(GitObject):
 
     def serialize(self, data):
         return kvlm_serializze(data)
+
+class GitTreeLeaf:
+    def __init__(self, mode, path, sha):
+        self.mode = mode
+        self.path = path
+        self.sha = sha
+
+class GitTree:
+    fmt = b'tree'
+
+    def __init__(self) -> None:
+        self.items = []
+    
+    def serialize(self):
+        return tree_serialize(self)
+    
+    def deserialize(self, data) -> None:
+        self.items = tree_parse(data)
