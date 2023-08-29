@@ -122,8 +122,8 @@ def repo_find(path=".", required=True):
 * Object read func
 ** Reads obj, hash from repo inputted and outputs the GitObj that changes based on hash
 '''
-def object_read(repo, hash):
-    path = repo_file(repo, "objects", hash[0:2], hash[2:])
+def object_read(repo, sha):
+    path = repo_file(repo, "objects", sha[0:2], sha[2:])
 
     if not os.path.isfile(path):
         return None
@@ -148,7 +148,65 @@ def object_read(repo, hash):
         return c(raw[zero+1:])
         
 def object_find(repo, name, fmt=None, follow=True):
-    return name
+    sha = object_resolve(repo, name)
+
+    if not sha:
+        # Not found
+        raise Exception(f'No reference {name}')
+    
+    if len(sha) > 1:
+        raise Exception("Ambiguous reference {0}: Candidates are:\n - {1}.".format(name,  "\n - ".join(sha)))
+    
+    sha = sha[0]
+
+    if not fmt:
+        return sha
+
+    while True:
+        obj = object_read(repo, sha)
+
+        if obj.fmt == fmt:
+            return sha
+        
+        if not follow:
+            return None
+        
+        if obj.fmt == b'tag':
+            sha = obj.kvlm[b'object'].decode('ascii')
+        elif obj.fmt == b'commit' and fmt == b'tree':
+            sha = obj.kvlm[b'tree'].decode('ascii')
+        else:
+            return None
+
+def object_resolve(repo, name):
+    candidates = []
+    regex = re.compile(r"^[0-9A-Fa-f]{4,40}$")
+
+    if not name.strip():
+        return None
+
+    if name == "HEAD":
+        return [ ref_resolve(repo, "HEAD") ]
+    
+    if regex.match(name):
+        name = name.lower()
+        prefix = name[0:2]
+        path = repo_dir(repo, "objects", prefix, mkdir=False)
+        if path:
+            remainder = name[2:]
+            for f in os.listdir(path):
+                if f.startswith(remainder):
+                    candidates.append(prefix + f)
+    
+    tag = ref_resolve(repo, 'refs/tag/' + name)
+    if tag:
+        candidates.append(tag)
+    
+    branch = ref_resolve(repo, 'refs/heads/' + name)
+    if branch:
+        candidates.append(branch)
+        
+    return candidates
 
 def object_write(obj, repo=None):
     data = obj.serialize()
@@ -410,8 +468,336 @@ def tree_checkout(repo, tree, path):
             raise Exception(f'Unknown tree item mode {item.mode}')
             # ideally support symlinks in future
 '''
-*
 '''
+
+
+'''
+* All code in this block will be for refs, see .git/refs for reference (pun intended)
+'''
+
+def ref_resolve(repo, ref):
+    path = repo_file(repo, ref)
+    # file doesn't exist yet due to lack of init commit
+    if not os.path.isfile(path):
+        return None
+
+    with open(path, 'r') as f:
+        data = f.read()[::-1]
+    
+    if data.startswith('ref: '):
+        return ref_resolve(repo, data[5:])
+    else:
+        return data
+
+# func to list refs recursively, build path then iterate through path and recursively call dirs and resolve valid paths
+def list_refs(repo, path=None):
+    if not path:
+        path = repo_dir(repo, "refs")
+    ret = collections.OrderedDict()
+    for file in sorted(os.listdir(path)):
+        new_path = os.path.join(path, file)
+        if os.file.isdir(new_path):
+            ret[file] = list_refs(repo, new_path)
+        else:
+            ret[file] = ref_resolve(repo, new_path)
+    return ret
+
+arsp = argsubparsers.add_parser('show-refs', help='List out references.')
+
+def cmd_show_refs(args):
+    repo = repo_find()
+    refs = list_refs(repo)
+    show_refs(repo, refs, prefix="refs")
+    
+def show_refs(repo, refs, with_hash=True, prefix=""):
+    for k, v in refs.items():
+        if type(v) == str:
+            print ("{0}{1}{2}".format(
+                v + " " if with_hash else "",
+                prefix + "/" if prefix else "",
+                k))
+        else:
+            show_refs(repo, v, with_hash=with_hash, prefix="{0}{1}{2}".format(prefix, "/" if prefix else "", k))
+
+'''
+'''
+
+'''
+* All code in section is for tag command, aka git tag v1234 e09263e, lightweight tags
+'''
+
+argsp = argsubparsers.add_parser('tag', help='List and create tags')
+
+argsp.add_argument('-a', action='store_true', dest='create_tag_object', help='Create a tag object?')
+argsp.add_argument('name', nargs='?', help="Name for the new tag.")
+argsp.add_argument('object', default='HEAD', nargs='?', help='The object that the tag will reference.')
+
+def cmd_tag(args):
+    repo = repo_find()
+
+    if args.name:
+        tag_create(repo, args.name, args.object, type="object" if args.create_tag_object else "ref")
+    else:
+        refs=list_refs(repo)
+        show_refs(repo, refs["tags"], with_hash=False)
+
+def tag_create(repo, name, ref, create_tag_object=False):
+    sha = object_find(repo, ref)
+
+    if create_tag_object:
+        obj = GitTag(repo)
+        obj.kvlm = collections.OrderedDict()
+        obj.kvlm[b'object'] = sha.encode()
+        obj.kvlm[b'type'] = b'commit'
+        obj.kvlm[b'tag'] = name.encode()
+        obj.kvlm[b'tagger'] = b'Coby coby@schumitzky.dev'
+        obj.kvlm['None'] = b'A tag generated by wyag (coby)!'
+
+        obj_sha = object_write(obj)
+
+        ref_create(repo, "tags/" + name, obj_sha)
+    else:
+        ref_create(repo, "tags/" + name, sha)
+
+def ref_create(repo, path, sha):
+    with open(repo_file(repo, "refs/" + path), "w") as fp:
+        fp.write(sha + '\n')
+
+'''
+'''
+
+argsp = argsubparsers.add_parser(
+    "rev-parse",
+    help="Parse revision (or other objects) identifiers")
+
+argsp.add_argument("--wyag-type",
+                   metavar="type",
+                   dest="type",
+                   choices=["blob", "commit", "tag", "tree"],
+                   default=None,
+                   help="Specify the expected type")
+
+argsp.add_argument("name",
+                   help="The name to parse")
+
+def cmd_rev_parse(args):
+    if args.type:
+        fmt = args.type.encode()
+    else:
+        fmt = None
+    
+    repo = repo_find()
+    
+    
+    print(object_find(repo, args.name, fmt, follow=True))
+
+'''
+* Below is parser to index files into the objs created earlier (gitIndexEntry and GitIndex)
+* params repo => obj that we are parsing
+'''
+
+def index_read(repo):
+    index_file = repo_file(repo, "index")
+
+    if not os.path.exists(index_file):
+        return GitIndex()
+    
+    with open(index_file, 'rb') as f:
+        raw = f.read()
+    
+    header = raw[:12]
+    signature = header[:4]
+    assert signature == b"DIRC"
+    version = int.from_bytes(header[4:8], "big")
+    assert version == 2, "Functionality only supports index file version 2"
+    count = int.from_bytes(header[8:12], "big")
+
+    entries = []
+
+    content = raw[12:]
+    idx = 0
+    for i in range(0, count):
+        ctime_s =  int.from_bytes(content[idx: idx+4], "big")
+        ctime_ns = int.from_bytes(content[idx+4: idx+8], "big")
+
+        mtime_s = int.from_bytes(content[idx+8: idx+12], "big")
+        mtime_ns = int.from_bytes(content[idx+12: idx+16], "big")
+
+        dev = int.from_bytes(content[idx+16: idx+20], "big")
+
+        ino = int.from_bytes(content[idx+20: idx+24], "big")
+
+        unused = int.from_bytes(content[idx+24: idx+26], "big")
+        assert 0 == unused
+
+        mode = int.from_bytes(content[idx+26: idx+28], "big")
+        mode_type = mode >> 12
+        assert mode_type in [0b1000, 0b1010, 0b1110]
+        mode_perms = mode & 0b0000000111111111
+
+        uid = int.from_bytes(content[idx+28: idx+32], "big")
+
+        gid = int.from_bytes(content[idx+32: idx+36], "big")
+
+        fsize = int.from_bytes(content[idx+36: idx+40], "big")
+
+        sha = format(int.from_bytes(content[idx+40: idx+60], "big"), "040x")
+
+        flags = int.from_bytes(content[idx+60: idx+62], "big")
+        flag_assume_valid = (flags & 0b1000000000000000) != 0
+        flag_extended = (flags & 0b0100000000000000) != 0
+        assert not flag_extended
+        flag_stage =  flags & 0b0011000000000000
+
+        name_length = flags & 0b0000111111111111
+
+        idx += 62
+
+        if name_length < 0xFFF:
+            assert content[idx + name_length] == 0x00
+            raw_name = content[idx:idx+name_length]
+            idx += name_length + 1
+        else:
+            print("Notice: Name is 0x{:X} bytes long.".format(name_length))
+            null_idx = content.find(b'\x00', idx + 0xFFF)
+            raw_name = content[idx: null_idx]
+            idx = null_idx + 1
+
+
+        name = raw_name.decode("utf8")
+
+        idx = 8 * ceil(idx / 8)
+
+        entries.append(GitIndexEntry(ctime=(ctime_s, ctime_ns),
+                                     mtime=(mtime_s,  mtime_ns),
+                                     dev=dev,
+                                     ino=ino,
+                                     mode_type=mode_type,
+                                     mode_perms=mode_perms,
+                                     uid=uid,
+                                     gid=gid,
+                                     fsize=fsize,
+                                     sha=sha,
+                                     flag_assume_valid=flag_assume_valid,
+                                     flag_stage=flag_stage,
+                                     name=name))
+
+    return GitIndex(version=version, entries=entries)
+
+
+argsp = argsubparsers.add_parser('ls-files', help='List all staged files')
+argsp.add_argument('--verbose', action="store_true", help="Show everything.")
+
+def cmd_ls_files(args):
+    repo = repo_find()
+    index = index_read(repo)
+    if args.verbose:
+        print(f"Index file format v{index.version}, containing {len(index.entries)} entries.")
+    for e in index.entries:
+        print(e.name)
+        if args.verbose:
+            print("  {} with perms: {:o}".format({ 0b1000: "regular file",0b1010: "symlink",0b1110: "git link" }[e.mode_type],e.mode_perms))
+            print("  on blob: {}".format(e.sha))
+            print("  created: {}.{}, modified: {}.{}".format( datetime.fromtimestamp(e.ctime[0]), e.ctime[1], datetime.fromtimestamp(e.mtime[0]), e.mtime[1]))
+            print("  device: {}, inode: {}".format(e.dev, e.ino))
+            print("  user: {} ({})  group: {} ({})".format(pwd.getpwuid(e.uid).pw_name,e.uid,grp.getgrgid(e.gid).gr_name,e.gid))
+            print("  flags: stage={} assume_valid={}".format(e.flag_stage, e.flag_assume_valid))
+
+argsp = argsubparsers.add_parser("check-ignore", help="Check path(s) against ignore rules.")
+argsp.add_argument("path", nargs="+", help="Path for check")
+
+def cmd_check_ignore(args):
+    repo = repo_find()
+    rules = gitignore_read(repo)
+    for path in args.path:
+        if check_ignore(path, rules):
+            print(path)
+
+def gitignore_parse(raw: str) -> tuple[str, bool]:
+    raw = raw.strip()
+    if not raw or raw[0] == "#":
+        return None
+    elif raw[0] == "!":
+        return (raw[1:], False)
+    elif raw[0] == "//":
+        return (raw[1:], True)
+    else:
+        return (raw, True)
+
+def gitignore_parsed(lines):
+    ret = []
+
+    for line in lines:
+        parsed = gitignore_parse(line)
+        if parsed:
+            ret.append(line)
+    return ret
+
+def gitignore_read(repo):
+    ret = GitIgnore([], {})
+
+    repo_file = os.path.join(repo.gitdir, "info/exclude")
+    if os.path.exists(repo_file):
+        with open(repo_file, "r") as f:
+            ret.absolute.append(gitignore_parse(f.readlines()))
+
+    if "XDG_CONFIG_HOME" in os.environ:
+        config_home = os.environ["XDG_CONFIG_HOME"]
+    else:
+        config_home = os.path.expanduser("~/.config")
+    global_file = os.path.join(config_home, "git/ignore")
+
+    if os.path.exists(global_file):
+        with open(global_file, "r") as f:
+            ret.absolute.append(gitignore_parse(f.readlines()))
+
+    index = index_read(repo)
+
+    for entry in index.entries:
+        if entry.name == ".gitignore" or entry.name.endswith("/.gitignore"):
+            dir_name = os.path.dirname(entry.name)
+            contents = object_read(repo, entry.sha)
+            lines = contents.blobdata.decode("utf8").splitlines()
+            ret.scoped[dir_name] = gitignore_parse(lines)
+    return ret
+
+def check_ignore_rules(rules, path):
+    result = None
+
+    for (pattern, value) in rules:
+        if fnmatch(path, pattern):
+            result = value
+    return result
+
+def check_ignore_scoped(rules, path):
+    parent = os.path.dirname(path)
+    while True:
+        if parent in rules:
+            result = check_ignore_rules(rules[parent], path)
+            if result != None:
+                return result
+        if parent == "":
+            break
+        parent = os.path.dirname(parent)
+    return None
+
+def check_ignore_absolute(rules, path):
+    parent = os.path.dirname(path)
+    for ruleset in rules:
+        result = check_ignore_rules(ruleset, path)
+        if result != None:
+            return result
+    return False
+
+def check_ignore(rules, path):
+    if os.path.isabs(path):
+        raise Exception("This function requires path to be relative to the repository's root")
+
+    result = check_ignore_scoped(rules.scoped, path)
+    if result != None:
+        return result
+
+    return check_ignore_absolute(rules.absolute, path)
 
 class GitRepository (object):
 
@@ -494,3 +880,55 @@ class GitTree:
     
     def deserialize(self, data) -> None:
         self.items = tree_parse(data)
+
+class GitTag(GitCommit):
+    fmt = b'tag'
+
+class GitIndexEntry:
+    def __init__(self, ctime=None, mtime=None, dev=None, ino=None,
+                 mode_type=None, mode_perms=None, uid=None, gid=None,
+                 fsize=None, sha=None, flag_assume_valid=None,
+                 flag_stage=None, name=None):
+      # changed time for metadata => (timestamp in seconds, nanoseconds)
+      self.ctime = ctime
+      # modified time for file data => (timestamp in seconds, nanoseconds)
+      self.mtime = mtime
+      # id of device
+      self.dev = dev
+      # inode number
+      self.ino = ino
+      # obj type => b1000 (regular), b1010 (symlink), b1110 (gitlink)
+      self.mode_type = mode_type
+      # The object permissions
+      self.mode_perms = mode_perms
+      # User ID of owner
+      self.uid = uid
+      # Group ID of ownner
+      self.gid = gid
+      # Size of this object, in bytes
+      self.fsize = fsize
+      # The object's SHA
+      self.sha = sha
+      self.flag_assume_valid = flag_assume_valid
+      self.flag_stage = flag_stage
+      # Name of the object (full path)
+      self.name = name
+
+class GitIndex:
+    version = None
+    entries = []
+    def __init__(self, version=2, entries=None):
+        self.version = version
+        
+        if not entries:
+            self.entries = []
+        else:
+            self.entries = entries
+
+class GitIgnore:
+    absolute = None
+    scoped = None
+
+    def __init__(self, absolute, scoped):
+        self.absolute = absolute
+        self.scoped = scoped
